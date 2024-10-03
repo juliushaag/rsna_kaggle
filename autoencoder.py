@@ -13,7 +13,7 @@ class ResNetAutoencoder(nn.Module):
     super(ResNetAutoencoder, self).__init__()
     
     # Load a pre-trained ResNet18 model
-    self.encoder = resnet18(pretrained=True)
+    self.encoder = resnet18(weights=True)
     
     # Remove the fully connected layer
     self.encoder = nn.Sequential(*list(self.encoder.children())[:-1])
@@ -31,6 +31,8 @@ class ResNetAutoencoder(nn.Module):
     )
     
   def forward(self, x):
+    # Adjust the first convolutional layer to accept single-channel images
+    x = torch.cat([x, x, x], dim=2)  # Convert single-channel to 3-channel by duplicating the channel
     x = self.encoder(x)
     x = x.view(x.size(0), 512, 1, 1)  # Reshape for the decoder
     x = self.decoder(x)
@@ -42,12 +44,13 @@ class ResNetAutoencoder(nn.Module):
 # Example usage
 if __name__ == "__main__":
 
-  imgs = json.loads("images.json")
+  imgs = json.load(open("images.json", "r"))
 
-  img = imgs.values[0]
+
+  img_data = torch.tensor(pydicom.dcmread(list(imgs.values())[0]).pixel_array)
+  print(img_data.shape)
 
   model = ResNetAutoencoder()
-  print(model)
-  input_image = torch.randn(1, 3, 224, 224)  # Example input
-  output_image = model(input_image)
-  print(output_image.shape)
+
+  input_image = torch.randn(1, 3, 512, 512)  # Example input
+  output_image = model(img_data.unsqueeze(0))
