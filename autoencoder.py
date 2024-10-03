@@ -80,14 +80,14 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 class RSNADataSet(torch.utils.data.Dataset):
     def __init__(self):
-        self.imgs = list(json.load(open("processed/lookup.json", "r")).values())[:1]
+        self.imgs = list(json.load(open("processed/lookup.json", "r")).values())[:24]
 
     def __len__(self):
         return len(self.imgs)
 
     def __getitem__(self, idx):
         img = np.load(self.imgs[idx] + ".npy")
-        return (torch.tensor(img).unsqueeze(0) / 65504.0)
+        return (torch.tensor(img).unsqueeze(0) / 65504.0 + 1) / 2
 
 dataset = torch.utils.data.dataloader.DataLoader(RSNADataSet(), batch_size=BS, shuffle=True, num_workers=12, prefetch_factor=8)
 
@@ -95,7 +95,7 @@ random.seed(42)
 # Example usage
 if __name__ == "__main__":
     model = ResNetAutoencoder().to(DEVICE)
-    opt = torch.optim.RMSprop(model.parameters(), lr=1e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
     scaler = torch.amp.grad_scaler.GradScaler()
 
     print("Training model with", sum(p.element_size() * p.nelement() for p in model.parameters()) // (2**20), "MB parameters")
@@ -111,12 +111,12 @@ if __name__ == "__main__":
 
             model.zero_grad()
             y = model(img)
-            loss = F.mse_loss(y, img)
+            assert (img > 0).all()
+            loss = F.binary_cross_entropy(y, img)
             
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-
+            loss.backward()
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
             losses.append(loss.item())
             epoch_loss += loss.item()
             epoch_norm += norm
