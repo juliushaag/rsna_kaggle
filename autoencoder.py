@@ -13,123 +13,147 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from matplotlib import pyplot as plt
 
+from tools.prep_imgs import transform_img
+
+
 class ResNetAutoencoder(nn.Module):
-    def __init__(self):
+    def __init__(self, emb_dim = 2056):
         super(ResNetAutoencoder, self).__init__()
 
-        self.embd_dim = 1024  
+        self.embd_dim = emb_dim
+
         # Load a pre-trained ResNet18 model
         self.encoder = resnet18(weights=ResNet18_Weights.DEFAULT)
 
         # Adjust the first convolutional layer to accept single-channel images
         self.encoder.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+
         # Adjust the fully connected layer to output 512x16x16
         self.encoder.fc = nn.Linear(self.encoder.fc.in_features, self.embd_dim)
 
-        self.l1 = nn.Linear(self.embd_dim, self.embd_dim)
-        self.ln1 = nn.LayerNorm(self.embd_dim)
-
-        self.l2 = nn.Linear(self.embd_dim, self.embd_dim)
-        self.ln2 = nn.LayerNorm(self.embd_dim)
-
-        self.l3 = nn.Linear(self.embd_dim, self.embd_dim)
-        self.ln3 = nn.LayerNorm(self.embd_dim)
-
-        self.l4 = nn.Linear(self.embd_dim, self.embd_dim)
-        self.ln4 = nn.LayerNorm(self.embd_dim)
-
-        self.proj = nn.Linear(self.embd_dim, 512 * 16 * 16)
+        self.proj = nn.Linear(self.embd_dim, 256 * 256)
 
         # Decoder layers with adjusted dimensions to output 512x512 images
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),
-            nn.LayerNorm(32),
-            nn.ReLU(True),
             nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.LayerNorm(64),
+            nn.BatchNorm2d(128),
             nn.ReLU(True),
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.LayerNorm(128),
+            nn.BatchNorm2d(64),
             nn.ReLU(True),
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.LayerNorm(256),
+            nn.BatchNorm2d(32),
             nn.ReLU(True),
             nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
-            nn.LayerNorm(512),
+            nn.BatchNorm2d(16),
             nn.ReLU(True),
             nn.ConvTranspose2d(16, 1, kernel_size=3, stride=1, padding=1),
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
-        B, *_ = x.shape
-        x = self.encoder(x)
+        return self.encoder(x)
 
-        x = x + F.relu(self.ln1(self.l1(x)))
-        x = x + F.relu(self.ln2(self.l2(x)))
-        x = x + F.relu(self.ln3(self.l3(x)))
-        x = x + F.relu(self.ln4(self.l4(x)))
-
-        x = self.proj(x).view(B, 512, 16, 16)
+    def autoencode(self, img):
+        B, *_ = img.shape
+        x = self(img)
+        x = self.proj(x).view(B, 256, 16, 16)
         x = self.decoder(x)
-        return (F.sigmoid(x) + 1) / 2
+        return x
 
 
-BS = 24
-EPOCHS = 100
+BS = 32
+EPOCHS = 20
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 class RSNADataSet(torch.utils.data.Dataset):
-    def __init__(self):
-        self.imgs = list(json.load(open("processed/lookup.json", "r")).values())[:24]
-
+    def __init__(self, index = 0, max_elements = 1000000):
+        self.imgs = torch.load(f"data/img_shard_{index}.pt", weights_only=True)[:max_elements].to(torch.float32)
+        
     def __len__(self):
         return len(self.imgs)
 
     def __getitem__(self, idx):
-        img = np.load(self.imgs[idx] + ".npy")
-        return (torch.tensor(img).unsqueeze(0) / 65504.0 + 1) / 2
+        return self.imgs[idx]
+     
 
-dataset = torch.utils.data.dataloader.DataLoader(RSNADataSet(), batch_size=BS, shuffle=True, num_workers=12, prefetch_factor=8)
 
-random.seed(42)
 # Example usage
 if __name__ == "__main__":
-    model = ResNetAutoencoder().to(DEVICE)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    scaler = torch.amp.grad_scaler.GradScaler()
+    random.seed(42)
+    # model = ResNetAutoencoder(2056 * 2)
+    
+    model = torch.load("models/autoencoder.pt", weights_only=False).to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    
+    train_dataset = torch.utils.data.dataloader.DataLoader(RSNADataSet(0), batch_size=BS, shuffle=True, num_workers=12, pin_memory=True, prefetch_factor=8)
+    test_dataset = torch.utils.data.dataloader.DataLoader(RSNADataSet(1, 1000), batch_size=BS, pin_memory=True)
+    
 
-    print("Training model with", sum(p.element_size() * p.nelement() for p in model.parameters()) // (2**20), "MB parameters")
+    print(f"Training model with {sum(p.element_size() * p.nelement() for p in model.parameters()) / (2**30):.3f}GB parameters")
 
-    losses = list()
+    train_losses = list()
+    test_losses = list()
     norm = 0.0
-    for i in range(EPOCHS):
-        epoch_loss = 0
-        epoch_norm = 0
-        for img in tqdm(dataset):
 
-            img = img.to(DEVICE)
+    test_intervall = 200
 
+    model.train()
+    for n_epoch in range(EPOCHS):
+        intervall_loss = list()
+        for i, batch in enumerate(train_dataset):
+            batch = batch.to(DEVICE)
             model.zero_grad()
-            y = model(img)
-            assert (img > 0).all()
-            loss = F.binary_cross_entropy(y, img)
-            
+
+            y = model.autoencode(batch)
+            loss = F.binary_cross_entropy(y, batch)
+
             loss.backward()
             norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            losses.append(loss.item())
-            epoch_loss += loss.item()
-            epoch_norm += norm
 
-    plt.plot(np.log(losses))
+            opt.step()
+            intervall_loss.append(loss.item())
+            
+            if i % test_intervall == 0 and i != 0:
+                model.eval()
+                with torch.no_grad():
+                    losses = list()
+                    for batch in test_dataset:
+                        batch = batch.to(DEVICE)
+                        y = model.autoencode(batch)
+                        loss = F.binary_cross_entropy(y, batch)
+                        losses.append(loss.item())
+                    test_loss = sum(losses) / len(losses)
+                    train_loss = sum(intervall_loss) / len(intervall_loss)
+                    intervall_loss.clear()
+
+                    train_losses.append(train_loss)
+                    test_losses.append(test_loss)
+                    print(f"Epoch {n_epoch}:{i} train_loss: {train_loss:.4f} test_loss: {test_loss:.4f}")
+                model.train()
+
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+     
+    torch.save(model, "models/autoencoder.pt")
+
+    plt.plot(np.log(train_losses))
+    plt.plot(np.log(test_losses))
     plt.show()
 
-    img = next(iter(dataset)).to(DEVICE)
-    y = model(img)
+    model.eval()
+    imgs = next(iter(test_dataset))[:4].to(DEVICE)
 
-    for k in range(len(y)):
-        plt.subplot(1, 2, 1)
-        plt.imshow(img[k].cpu().numpy().squeeze(), cmap="gray")
-        plt.subplot(1, 2, 2)
-        plt.imshow(y[k].detach().cpu().numpy().squeeze(), cmap="gray")
-        plt.show()
+    with torch.no_grad():
+        pred = model.autoencode(imgs)
+
+    plt.figure(figsize=(16, 8))
+    for i in range(len(imgs)):
+
+        v_img = imgs[i].cpu().numpy().squeeze()
+        v_pred = pred[i].detach().cpu().numpy().squeeze()
+        plt.subplot(2, 4, i * 2 + 1)
+        plt.imshow(v_img, cmap="gray")
+        plt.subplot(2, 4, i * 2 + 2)
+        plt.imshow(v_pred, cmap="gray")
+    
+    plt.show()

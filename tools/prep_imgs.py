@@ -2,17 +2,17 @@
 
 
 import json
-import random
 import pydicom
 from matplotlib import pyplot as plt
 import numpy as np
 from pathlib import Path
-from PIL import Image
 import cv2 as cv
 from tqdm import tqdm
+import concurrent.futures
 
 
-def transform_img(path: Path, output_path, desired_shape=(512, 512)):
+
+def transform_img(path: Path, desired_shape=(512, 512)):
   
   with pydicom.dcmread(path) as img:
     H, W = img.pixel_array.shape
@@ -29,25 +29,32 @@ def transform_img(path: Path, output_path, desired_shape=(512, 512)):
     else:
       cv.resize(img.pixel_array, desired_shape, dst=res_img)
   
-  if res_img.dtype == np.uint16:
-    res_img = (res_img - 32768).astype(np.int16)
-
-  # enable this for visualizing the images
-  # plt.imsave(output_path.with_suffix(".png"), res_img, cmap="gray")
-  # plt.imsave(output_path.with_suffix(".original.png"), img.pixel_array, cmap="gray")
-
-  # store the images in numpy format
-  np.save(output_path, res_img)
-
-images = list(json.load(open("images.json", "r")).items())
+  # min max normalization 
+  res_img = res_img - res_img.min()
+  res_img = res_img / res_img.max()
+  return res_img.astype(np.float16)
 
 
-lookup = {}
-output_dir = Path("processed")
-for name, file in tqdm(images):
-  output_dir.mkdir(parents=True, exist_ok=True)
-  output_path = output_dir / name
-  lookup[name] = str(output_path)
-  transform_img(Path(file), output_path)
+if __name__ == "__main__":
+  images = list(json.load(open("images.json", "r")).items())
 
-json.dump(lookup, fp=open(output_dir / "lookup.json", "w"), indent=2)
+
+  def thread_task(name, file):
+    output_path = Path("processed") / name
+    img = transform_img(file)
+    np.save(output_path.with_suffix(".npy"), img)
+
+  lookup = {}
+  output_dir = Path("processed")
+  with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+    futures = list()
+    for name, file in images:
+      futures.append(executor.submit(thread_task, name, file))
+      lookup[name] = file
+
+    for future in tqdm(concurrent.futures.as_completed(futures)):
+      future.result()
+
+
+
+  json.dump(lookup, fp=open(output_dir / "lookup.json", "w"), indent=2)
